@@ -1,6 +1,7 @@
 import argparse
 import os
 import logging
+import zipfile
 
 import torch
 from huggingface_hub import HfApi, snapshot_download
@@ -9,6 +10,23 @@ from tqdm import tqdm
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+def extract_data_from_zip(zip_filepath, extract_path):
+    """Extracts data.pkl from a .bin (zip) file."""
+    try:
+        with zipfile.ZipFile(zip_filepath, 'r') as zip_ref:
+            for member in zip_ref.namelist():
+                if member.endswith('data.pkl'):
+                    zip_ref.extract(member, path=extract_path)
+                    return os.path.join(extract_path, member)
+        logging.warning(f"'data.pkl' not found in {zip_filepath}")
+        return None
+    except zipfile.BadZipFile:
+        logging.error(f"'{zip_filepath}' does not appear to be a valid zip file.")
+        return None
+    except Exception as e:
+        logging.error(f"Error extracting data from {zip_filepath}: {e}")
+        return None
 
 def convert_and_upload(repo_id, max_shard_size, upload_to_hub, local_dir=None, cleanup=False):
     """
@@ -23,7 +41,9 @@ def convert_and_upload(repo_id, max_shard_size, upload_to_hub, local_dir=None, c
     """
 
     safetensors_dir = os.path.join(os.getcwd(), "safetensors_files")
+    extracted_data_dir = os.path.join(os.getcwd(), "extracted_data")  # New directory for extracted data.pkl files
     os.makedirs(safetensors_dir, exist_ok=True)
+    os.makedirs(extracted_data_dir, exist_ok=True)
 
     if local_dir:
         repo_path = local_dir
@@ -47,8 +67,16 @@ def convert_and_upload(repo_id, max_shard_size, upload_to_hub, local_dir=None, c
 
     for bin_file in tqdm(bin_files, desc="Converting .bin to .safetensors"):
         try:
+            bin_filepath = os.path.join(repo_path, bin_file)
+
+            # Extract data.pkl from the .bin (zip) file
+            extracted_data_path = extract_data_from_zip(bin_filepath, extracted_data_dir)
+            if not extracted_data_path:
+                logging.warning(f"Skipping {bin_file} due to missing data.pkl")
+                continue
+
             state_dict = {}
-            with safe_open(os.path.join(repo_path, bin_file), framework="pt", device="cpu") as f:
+            with safe_open(extracted_data_path, framework="pt", device="cpu") as f:
                 for k in f.keys():
                     state_dict[k] = f.get_tensor(k)
 
@@ -76,9 +104,10 @@ def convert_and_upload(repo_id, max_shard_size, upload_to_hub, local_dir=None, c
             if cleanup:
                 try:
                     os.remove(os.path.join(repo_path, bin_file))
-                    logging.info(f"Removed original .bin file: {bin_file}")
+                    os.remove(extracted_data_path)
+                    logging.info(f"Removed original .bin file and extracted data: {bin_file}")
                 except Exception as e:
-                    logging.error(f"Error removing {bin_file}: {e}")
+                    logging.error(f"Error removing {bin_file} or its extracted data: {e}")
 
         except Exception as e:
             logging.error(f"Error converting {bin_file}: {e}")
