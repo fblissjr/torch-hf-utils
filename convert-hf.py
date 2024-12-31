@@ -2,9 +2,11 @@ import argparse
 import json
 import os
 import shutil
+import logging
 from collections import defaultdict
 from tempfile import TemporaryDirectory
 from typing import Dict, List, Optional, Set, Tuple
+import zipfile
 
 import torch
 
@@ -12,6 +14,8 @@ from huggingface_hub import CommitInfo, CommitOperationAdd, Discussion, HfApi, h
 from huggingface_hub.file_download import repo_folder_name
 from safetensors.torch import _find_shared_tensors, _is_complete, load_file, save_file
 
+# Configure logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 COMMIT_DESCRIPTION = """
 This is an automated PR created with https://huggingface.co/spaces/safetensors/convert
@@ -32,6 +36,22 @@ Feel free to ignore this PR.
 
 ConversionResult = Tuple[List["CommitOperationAdd"], List[Tuple[str, "Exception"]]]
 
+def extract_data_from_zip(zip_filepath, extract_path):
+    """Extracts data.pkl from a .bin (zip) file."""
+    try:
+        with zipfile.ZipFile(zip_filepath, 'r') as zip_ref:
+            for member in zip_ref.namelist():
+                if member.endswith('data.pkl'):
+                    zip_ref.extract(member, path=extract_path)
+                    return os.path.join(extract_path, member)
+        logging.warning(f"'data.pkl' not found in {zip_filepath}")
+        return None
+    except zipfile.BadZipFile:
+        logging.error(f"'{zip_filepath}' does not appear to be a valid zip file.")
+        return None
+    except Exception as e:
+        logging.error(f"Error extracting data from {zip_filepath}: {e}")
+        return None
 
 def _remove_duplicate_names(
     state_dict: Dict[str, torch.Tensor],
@@ -80,7 +100,6 @@ def _remove_duplicate_names(
                 to_remove[keep_name].append(name)
     return to_remove
 
-
 def get_discard_names(model_id: str, revision: Optional[str], folder: str, token: Optional[str]) -> List[str]:
     try:
         import json
@@ -103,10 +122,8 @@ def get_discard_names(model_id: str, revision: Optional[str], folder: str, token
         discard_names = []
     return discard_names
 
-
 class AlreadyExists(Exception):
     pass
-
 
 def check_file_size(sf_filename: str, pt_filename: str):
     sf_size = os.stat(sf_filename).st_size
@@ -120,32 +137,34 @@ def check_file_size(sf_filename: str, pt_filename: str):
          """
         )
 
-
 def rename(pt_filename: str) -> str:
     filename, ext = os.path.splitext(pt_filename)
     local = f"{filename}.safetensors"
     local = local.replace("pytorch_model", "model")
     return local
 
-
 def convert_multi(
-    model_id: str, *, revision=Optional[str], folder: str, token: Optional[str], discard_names: List[str]
+    folder: str, *, revision: Optional[str], token: Optional[str], discard_names: List[str], model_id: Optional[str]
 ) -> ConversionResult:
-    filename = hf_hub_download(
-        repo_id=model_id, revision=revision, filename="pytorch_model.bin.index.json", token=token, cache_dir=folder
-    )
-    with open(filename, "r") as f:
+    index_filename = os.path.join(folder, "pytorch_model.bin.index.json")
+    with open(index_filename, "r") as f:
         data = json.load(f)
 
     filenames = set(data["weight_map"].values())
     local_filenames = []
-    for filename in filenames:
-        pt_filename = hf_hub_download(repo_id=model_id, filename=filename, token=token, cache_dir=folder)
+    errors = []
 
-        sf_filename = rename(pt_filename)
+    for filename in filenames:
+        pt_filename = os.path.join(folder, filename)
+
+        sf_filename = rename(filename)
         sf_filename = os.path.join(folder, sf_filename)
-        convert_file(pt_filename, sf_filename, discard_names=discard_names)
-        local_filenames.append(sf_filename)
+
+        try:
+            convert_file(pt_filename, sf_filename, discard_names=discard_names)
+            local_filenames.append(sf_filename)
+        except Exception as e:
+            errors.append((pt_filename, e))
 
     index = os.path.join(folder, "model.safetensors.index.json")
     with open(index, "w") as f:
@@ -158,56 +177,64 @@ def convert_multi(
     operations = [
         CommitOperationAdd(path_in_repo=local.split("/")[-1], path_or_fileobj=local) for local in local_filenames
     ]
-    errors: List[Tuple[str, "Exception"]] = []
 
     return operations, errors
 
-
 def convert_single(
-    model_id: str, *, revision: Optional[str], folder: str, token: Optional[str], discard_names: List[str]
+    folder: str, *, revision: Optional[str], token: Optional[str], discard_names: List[str], model_id: Optional[str]
 ) -> ConversionResult:
-    pt_filename = hf_hub_download(
-        repo_id=model_id, revision=revision, filename="pytorch_model.bin", token=token, cache_dir=folder
-    )
+    pt_filename = os.path.join(folder, "pytorch_model.bin")
 
     sf_name = "model.safetensors"
     sf_filename = os.path.join(folder, sf_name)
-    convert_file(pt_filename, sf_filename, discard_names)
-    operations = [CommitOperationAdd(path_in_repo=sf_name, path_or_fileobj=sf_filename)]
-    errors: List[Tuple[str, "Exception"]] = []
-    return operations, errors
 
+    try:
+        convert_file(pt_filename, sf_filename, discard_names)
+        operations = [CommitOperationAdd(path_in_repo=sf_name, path_or_fileobj=sf_filename)]
+        errors: List[Tuple[str, "Exception"]] = []
+    except Exception as e:
+        operations = []
+        errors = [(pt_filename, e)]
+
+    return operations, errors
 
 def convert_file(
     pt_filename: str,
     sf_filename: str,
     discard_names: List[str],
 ):
-    loaded = torch.load(pt_filename, map_location="cpu", weights_only=True)
-    if "state_dict" in loaded:
-        loaded = loaded["state_dict"]
-    to_removes = _remove_duplicate_names(loaded, discard_names=discard_names)
+    extracted_data_dir = os.path.join(os.path.dirname(sf_filename), "extracted_data")
+    os.makedirs(extracted_data_dir, exist_ok=True)
+
+    extracted_data_path = extract_data_from_zip(pt_filename, extracted_data_dir)
+    if not extracted_data_path:
+        raise Exception(f"Could not extract data.pkl from {pt_filename}")
+
+    state_dict = torch.load(extracted_data_path, map_location="cpu", weights_only=True)
+
+    if "state_dict" in state_dict:
+        state_dict = state_dict["state_dict"]
+    to_removes = _remove_duplicate_names(state_dict, discard_names=discard_names)
 
     metadata = {"format": "pt"}
     for kept_name, to_remove_group in to_removes.items():
         for to_remove in to_remove_group:
             if to_remove not in metadata:
                 metadata[to_remove] = kept_name
-            del loaded[to_remove]
+            del state_dict[to_remove]
     # Force tensors to be contiguous
-    loaded = {k: v.contiguous() for k, v in loaded.items()}
+    state_dict = {k: v.contiguous() for k, v in state_dict.items()}
 
     dirname = os.path.dirname(sf_filename)
     os.makedirs(dirname, exist_ok=True)
-    save_file(loaded, sf_filename, metadata=metadata)
+    save_file(state_dict, sf_filename, metadata=metadata)
     check_file_size(sf_filename, pt_filename)
     reloaded = load_file(sf_filename)
-    for k in loaded:
-        pt_tensor = loaded[k]
+    for k in state_dict:
+        pt_tensor = state_dict[k]
         sf_tensor = reloaded[k]
         if not torch.equal(pt_tensor, sf_tensor):
             raise RuntimeError(f"The output tensors do not match for key {k}")
-
 
 def create_diff(pt_infos: Dict[str, List[str]], sf_infos: Dict[str, List[str]]) -> str:
     errors = []
@@ -224,8 +251,7 @@ def create_diff(pt_infos: Dict[str, List[str]], sf_infos: Dict[str, List[str]]) 
             errors.append(f"{key} : SF warnings contain {sf_only} which are not present in PT warnings")
     return "\n".join(errors)
 
-
-def previous_pr(api: "HfApi", model_id: str, pr_title: str, revision=Optional[str]) -> Optional["Discussion"]:
+def previous_pr(api: "HfApi", model_id: str, pr_title: str, revision: Optional[str]) -> Optional["Discussion"]:
     try:
         revision_commit = api.model_info(model_id, revision=revision).sha
         discussions = api.get_repo_discussions(repo_id=model_id)
@@ -239,35 +265,51 @@ def previous_pr(api: "HfApi", model_id: str, pr_title: str, revision=Optional[st
                 return discussion
     return None
 
+def convert_from_local(
+    model_id: str,
+    local_dir: str,
+    *,
+    revision: Optional[str] = None,
+    force: bool = False,
+    token: Optional[str] = None,
+) -> Tuple[Optional["CommitInfo"], List[Tuple[str, "Exception"]]]:
+    pr_title = "Adding `safetensors` variant of this model"
+    api = HfApi(token=token)
+    try:
+        operations = None
+        pr = previous_pr(api, model_id, pr_title, revision=revision)
 
-def convert_generic(
-    model_id: str, *, revision=Optional[str], folder: str, filenames: Set[str], token: Optional[str]
-) -> ConversionResult:
-    operations = []
-    errors = []
-
-    extensions = set([".bin", ".ckpt"])
-    for filename in filenames:
-        prefix, ext = os.path.splitext(filename)
-        if ext in extensions:
-            pt_filename = hf_hub_download(
-                model_id, revision=revision, filename=filename, token=token, cache_dir=folder
+        filenames = os.listdir(local_dir)
+        discard_names = get_discard_names(model_id, revision=revision, folder=local_dir, token=token)
+        if "pytorch_model.bin" in filenames:
+            operations, errors = convert_single(
+                local_dir, revision=revision, token=token, discard_names=discard_names, model_id=model_id
             )
-            dirname, raw_filename = os.path.split(filename)
-            if raw_filename == "pytorch_model.bin":
-                # XXX: This is a special case to handle `transformers` and the
-                # `transformers` part of the model which is actually loaded by `transformers`.
-                sf_in_repo = os.path.join(dirname, "model.safetensors")
-            else:
-                sf_in_repo = f"{prefix}.safetensors"
-            sf_filename = os.path.join(folder, sf_in_repo)
-            try:
-                convert_file(pt_filename, sf_filename, discard_names=[])
-                operations.append(CommitOperationAdd(path_in_repo=sf_in_repo, path_or_fileobj=sf_filename))
-            except Exception as e:
-                errors.append((pt_filename, e))
-    return operations, errors
+        elif "pytorch_model.bin.index.json" in filenames:
+            operations, errors = convert_multi(
+                local_dir, revision=revision, token=token, discard_names=discard_names, model_id=model_id
+            )
+        else:
+            raise RuntimeError(f"No valid pytorch model found in {local_dir}. Cannot convert")
 
+        new_pr = None
+        if operations:
+            new_pr = api.create_commit(
+                repo_id=model_id,
+                revision=revision,
+                operations=operations,
+                commit_message=pr_title,
+                commit_description=COMMIT_DESCRIPTION,
+                create_pr=True,
+            )
+            print(f"PR created at {new_pr.pr_url}")
+        else:
+            print("No files to convert")
+        return new_pr, errors
+
+    except Exception as e:
+        logging.error(f"Error during conversion: {e}")
+        return None, [(local_dir, e)]
 
 def convert(
     api: "HfApi", model_id: str, revision: Optional[str] = None, force: bool = False
@@ -325,7 +367,6 @@ def convert(
             shutil.rmtree(folder)
         return new_pr, errors
 
-
 if __name__ == "__main__":
     DESCRIPTION = """
     Simple utility tool to convert automatically some weights on the hub to `safetensors` format.
@@ -337,7 +378,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "model_id",
         type=str,
-        help="The name of the model on the hub to convert. E.g. `gpt2` or `facebook/wav2vec2-base-960h`",
+        help="The name of the model on the hub to convert. E.g. `gpt2` or `facebook/wav2vec2-base-960h`. Alternatively, the local directory if combined with --local_dir",
+        nargs='?',
+        default=None,
     )
     parser.add_argument(
         "--revision",
@@ -350,28 +393,65 @@ if __name__ == "__main__":
         help="Create the PR even if it already exists of if the model was already converted.",
     )
     parser.add_argument(
+        "--local_dir",
+        type=str,
+        help="Path to local directory containing PyTorch .bin files.",
+    )
+    parser.add_argument(
+        "--max_shard_size",
+        type=str,
+        default="5GB",
+        help="Maximum shard size for the converted .safetensors files.",
+    )
+    parser.add_argument(
+        "--no_upload",
+        action="store_false",
+        dest="upload_to_hub",
+        help="Skip uploading the converted files to the Hugging Face Hub.",
+    )
+    parser.add_argument(
+        "--cleanup",
+        action="store_true",
+        help="Delete the original .bin files after conversion.",
+    )
+    parser.add_argument(
         "-y",
         action="store_true",
-        help="Ignore safety prompt",
+        help="Skip the safety prompt",
     )
     args = parser.parse_args()
-    model_id = args.model_id
-    api = HfApi()
-    if args.y:
-        txt = "y"
-    else:
-        txt = input(
-            "This conversion script will unpickle a pickled file, which is inherently unsafe. If you do not trust this file, we invite you to use"
-            " https://huggingface.co/spaces/safetensors/convert or google colab or other hosted solution to avoid potential issues with this file."
-            " Continue [Y/n] ?"
+
+    if args.local_dir:
+        if args.model_id is None:
+            raise ValueError("When using --local_dir, you must specify a model_id for the target Hugging Face repository.")
+        commit_info, errors = convert_from_local(
+            model_id=args.model_id,
+            local_dir=args.local_dir,
+            revision=args.revision,
+            force=args.force,
         )
-    if txt.lower() in {"", "y"}:
-        commit_info, errors = convert(api, model_id, revision=args.revision, force=args.force)
+    else:
+        api = HfApi()
+        if args.y:
+            txt = "y"
+        else:
+            txt = input(
+                "This conversion script will unpickle a pickled file, which is inherently unsafe. If you do not trust this file, we invite you to use"
+                " https://huggingface.co/spaces/safetensors/convert or google colab or other hosted solution to avoid potential issues with this file."
+                " Continue [Y/n] ?"
+            )
+        if txt.lower() in {"", "y"}:
+            commit_info, errors = convert(api, args.model_id, revision=args.revision, force=args.force)
+        else:
+            print(f"Answer was `{txt}` aborting.")
+            exit()
+
+    if commit_info:
         string = f"""
-### Success 🔥
-Yay! This model was successfully converted and a PR was open using your token, here:
-[{commit_info.pr_url}]({commit_info.pr_url})
-        """
+    ### Success 🔥
+    Yay! This model was successfully converted and a PR was open using your token, here:
+    [{commit_info.pr_url}]({commit_info.pr_url})
+            """
         if errors:
             string += "\nErrors during conversion:\n"
             string += "\n".join(
@@ -379,4 +459,8 @@ Yay! This model was successfully converted and a PR was open using your token, h
             )
         print(string)
     else:
-        print(f"Answer was `{txt}` aborting.")
+        print("Conversion failed or was skipped.")
+        if errors:
+            print("\nErrors during conversion:")
+            for filename, e in errors:
+                print(f"Error while converting {filename}: {e}")
