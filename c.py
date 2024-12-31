@@ -50,7 +50,7 @@ class ResumableSafetensorConverter:
             offload_folder=str(self.offload_folder),
             cache_dir=str(self.cache_dir),
             offload_buffers=True,
-            torch_dtype=torch.float16  # Use FP16 to reduce memory usage
+            torch_dtype=torch.bfloat16  # Use FP16 to reduce memory usage
         )
         
         # Load existing progress
@@ -143,7 +143,7 @@ def convert_model(input_dir: str, output_dir: str, cache_dir: str):
         offload_buffers=True,
         offload_folder=str(offload_folder),
         max_memory={0: "20GB", "cpu": "50GB"},
-        torch_dtype=torch.float16,
+        torch_dtype=torch.bfloat16,
         low_cpu_mem_usage=True
     )
     
