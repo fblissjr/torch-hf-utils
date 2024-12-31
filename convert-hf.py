@@ -4,7 +4,7 @@ import logging
 import zipfile
 import json
 
-import typing Optional
+from typing import Optional
 import torch
 
 from huggingface_hub import CommitOperationAdd, HfApi
