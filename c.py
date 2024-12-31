@@ -49,6 +49,7 @@ class ResumableSafetensorConverter:
             device_map="auto",
             offload_folder=str(self.offload_folder),
             cache_dir=str(self.cache_dir),
+            offload_buffers=True,
             torch_dtype=torch.float16  # Use FP16 to reduce memory usage
         )
         
@@ -124,6 +125,45 @@ class ResumableSafetensorConverter:
             if self.offload_folder.exists():
                 import shutil
                 shutil.rmtree(str(self.offload_folder))
+                
+def convert_model(input_dir: str, output_dir: str, cache_dir: str):
+    print("Starting conversion process...")
+    
+    # Setup directories
+    output_dir = Path(output_dir)
+    cache_dir = Path(cache_dir)
+    offload_folder = cache_dir / "offload"
+    offload_folder.mkdir(parents=True, exist_ok=True)
+    
+    # Load model with optimized settings for large models
+    model = AutoModelForCausalLM.from_pretrained(
+        input_dir,
+        trust_remote_code=True,
+        device_map="auto",
+        offload_buffers=True,
+        offload_folder=str(offload_folder),
+        max_memory={0: "20GB", "cpu": "50GB"},
+        torch_dtype=torch.float16,
+        low_cpu_mem_usage=True
+    )
+    
+    # Get state dict and prepare for conversion
+    print("Getting state dict...")
+    state_dict = model.state_dict()
+    num_tensors = len(state_dict)
+    
+    print(f"Converting {num_tensors} tensors to safetensors format...")
+    out_file = output_dir / "model.safetensors"
+    
+    try:
+        tensors_tqdm = tqdm(state_dict.items(), total=num_tensors)
+        state_dict = {k: v.cpu() for k, v in tensors_tqdm}
+        print("\nSaving safetensors file...")
+        save_file(state_dict, str(out_file))
+        print(f"Successfully saved to {out_file}")
+    except Exception as e:
+        print(f"Error during conversion: {e}")
+        raise
 
 def main():
     parser = argparse.ArgumentParser(description='Convert model to safetensors with resume capability')
