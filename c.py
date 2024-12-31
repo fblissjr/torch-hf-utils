@@ -12,10 +12,19 @@ from safetensors.torch import save_file
 from typing import Dict, Any
 
 class ResumableSafetensorConverter:
-    def __init__(self, input_dir: str, output_dir: str):
+    def __init__(self, input_dir: str, output_dir: str, cache_dir: str):
         self.input_dir = Path(input_dir)
         self.output_dir = Path(output_dir)
+        self.cache_dir = Path(cache_dir)
+        
+        # Create all necessary directories
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Setup offload directories within cache directory
+        self.offload_folder = self.cache_dir / "model_offload"
+        self.offload_folder.mkdir(exist_ok=True)
+        
         self.progress_file = self.output_dir / "conversion_progress.json"
         
     def load_progress(self) -> Dict[str, Any]:
@@ -32,12 +41,15 @@ class ResumableSafetensorConverter:
         """Save conversion progress."""
         self.progress_file.write_text(json.dumps(progress, indent=2))
 
-    def convert_to_safetensors(self, shard_size: int = 5_000_000_000):  # 5GB default shard size
+    def convert_to_safetensors(self, shard_size: int = 8_000_000_000):
         print("Loading model...")
         model = AutoModelForCausalLM.from_pretrained(
             self.input_dir,
             trust_remote_code=True,
-            device_map="auto"  # Let transformers handle memory
+            device_map="auto",
+            offload_folder=str(self.offload_folder),
+            cache_dir=str(self.cache_dir),
+            torch_dtype=torch.float16  # Use FP16 to reduce memory usage
         )
         
         # Load existing progress
@@ -74,6 +86,9 @@ class ResumableSafetensorConverter:
                         shard_idx += 1
                         current_shard = {}
                         current_shard_size = 0
+                        
+                        # Clear CUDA cache after saving each shard
+                        torch.cuda.empty_cache()
                     
                     # Add tensor to current shard
                     current_shard[key] = tensor.cpu()
@@ -104,13 +119,20 @@ class ResumableSafetensorConverter:
             print(f"\nError during conversion: {e}")
             print("Progress has been saved - you can resume from this point")
             raise
+        finally:
+            # Clean up cache and offload directories
+            if self.offload_folder.exists():
+                import shutil
+                shutil.rmtree(str(self.offload_folder))
 
 def main():
     parser = argparse.ArgumentParser(description='Convert model to safetensors with resume capability')
     parser.add_argument('input_dir', help='Directory containing the input model')
     parser.add_argument('output_dir', help='Directory to save converted safetensors')
-    parser.add_argument('--shard-size', type=int, default=5_000_000_000, 
-                        help='Maximum size of each shard in bytes (default: 5GB)')
+    parser.add_argument('--cache-dir', default='/workspace/model_cache',
+                        help='Directory for cache and offloading (default: /workspace/model_cache)')
+    parser.add_argument('--shard-size', type=int, default=8_000_000_000, 
+                        help='Maximum size of each shard in bytes (default: 8GB)')
     args = parser.parse_args()
     
     if torch.cuda.is_available():
@@ -118,7 +140,7 @@ def main():
     else:
         print("Warning: No GPU detected - conversion may be slow")
     
-    converter = ResumableSafetensorConverter(args.input_dir, args.output_dir)
+    converter = ResumableSafetensorConverter(args.input_dir, args.output_dir, args.cache_dir)
     converter.convert_to_safetensors(args.shard_size)
 
 if __name__ == "__main__":
