@@ -1,10 +1,11 @@
 import os
 import json
 import argparse
+import glob
 from collections import defaultdict
 import torch
 from safetensors import safe_open
-from safetensors.torch import save_file
+from safetensors.torch import save_file, load_file
 
 def load_index_file(model_path):
     index_file = os.path.join(model_path, "model.safetensors.index.json")
@@ -12,10 +13,7 @@ def load_index_file(model_path):
         with open(index_file, "r") as f:
             return json.load(f)
     except FileNotFoundError:
-        print(
-            f"Index file not found at {index_file}. "
-            "Proceeding without it, but this may not be a sharded model."
-        )
+        print(f"Index file not found at {index_file}.")
         return None
 
 def inspect_model_weights(model_path):
@@ -50,7 +48,6 @@ def inspect_model_weights(model_path):
                                 print(f"Loaded additional weight from {file_name}: {key}")
                 except Exception as e:
                     print(f"Error opening or reading file {file_path}: {e}")
-
     else:
         # Non-sharded model (single .safetensors file)
         for file_name in os.listdir(model_path):
@@ -82,36 +79,50 @@ def summarize_model_structure(weights):
 
     return dict(layer_counts), other_keys, layer_details
 
+def create_or_update_index_file(weights, model_path):
+    index_file_path = os.path.join(model_path, "model.safetensors.index.json")
+    index_data = load_index_file(model_path)
+
+    if index_data is None:
+        index_data = {"metadata": {}, "weight_map": {}}
+
+    # Determine the total size of the weights
+    total_size = 0
+    for key, weight in weights.items():
+        total_size += weight.numpy().nbytes  # Use numpy() for safetensors compatibility
+        
+    index_data["metadata"]["total_size"] = total_size
+
+    # Update the weight map based on the current file structure
+    weight_map = index_data["weight_map"]
+    safetensors_files = glob.glob(os.path.join(model_path, "*.safetensors"))
+
+    # Assign weights to files
+    for file_path in safetensors_files:
+        filename = os.path.basename(file_path)
+        try:
+            with safe_open(file_path, framework="pt") as f:
+                for key in f.keys():
+                    weight_map[key] = filename
+        except Exception as e:
+            print(f"Error opening or reading file {file_path}: {e}")
+
+    # Update the index file
+    with open(index_file_path, "w") as f:
+        json.dump(index_data, f, indent=2)
+    print(f"Updated index file: {index_file_path}")
+
 def tie_weights(weights, output_path):
     if "lm_head.weight" not in weights and "model.embed_tokens.weight" in weights:
         print("Adding lm_head.weight by tying it to model.embed_tokens.weight")
         weights["lm_head.weight"] = weights["model.embed_tokens.weight"]
 
-        index_file_path = os.path.join(output_path, "model.safetensors.index.json")
-        if os.path.exists(index_file_path):
-            # Update the index file if it exists
-            index_data = load_index_file(output_path)
-            weight_map = index_data["weight_map"]
-
-            # Find a safetensors file to add the new weight to
-            if weight_map:
-                last_file = max(set(weight_map.values()))
-                weight_map["lm_head.weight"] = last_file
-
-                # Save updated index file
-                with open(index_file_path, "w") as f:
-                    json.dump(index_data, f, indent=2)
-            else:
-                print(
-                    "Warning: model.safetensors.index.json is not found. Cannot update weight map."
-                )
-        else:
-            print(
-                "Warning: model.safetensors.index.json not found. Cannot update weight map."
-            )
+        # Since we are modifying the weights, regenerate the index file
+        create_or_update_index_file(weights, output_path)
 
         # Save updated weights - this will overwrite existing files if not careful
         save_file(weights, os.path.join(output_path, "tied_model.safetensors"))
+        print(f"Saved tied weights to {os.path.join(output_path, 'tied_model.safetensors')}")
 
     return weights
 
@@ -125,21 +136,13 @@ if __name__ == "__main__":
         help="Path to the model weights folder (or HF cache directory)",
     )
     parser.add_argument(
-        "--tie_weights",
-        action="store_true",
-        help="Tie weights if lm_head is missing",
+        "--tie_weights", action="store_true", help="Tie weights if lm_head is missing"
     )
     parser.add_argument(
-        "--output",
-        type=str,
-        help="Output path for tied weights",
-        default=None
+        "--output", type=str, help="Output path for tied weights", default=None
     )
     parser.add_argument(
-        "--layer_num",
-        type=int,
-        default=None,
-        help="Layer number to inspect",
+        "--layer_num", type=int, default=None, help="Layer number to inspect"
     )
     args = parser.parse_args()
 
@@ -182,10 +185,8 @@ if __name__ == "__main__":
         for key in sorted(layer_keys)[:10]:  # Print first 10 layer keys as a sample
             print(f"- {key}: {weights[key].shape}")
 
-        # Print all parameters
-        print("\nAll model parameters:")
-        for key, value in weights.items():
-            print(f"- {key}: {value.shape}")
+        # Call the function to create or update the index file
+        create_or_update_index_file(weights, model_folder)
 
     except Exception as e:
         print(f"An error occurred: {str(e)}")
