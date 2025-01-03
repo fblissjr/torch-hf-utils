@@ -13,7 +13,10 @@ def load_index_file(model_path):
         with open(index_file, "r") as f:
             return json.load(f)
     except FileNotFoundError:
-        print(f"Index file not found at {index_file}.")
+        print(
+            f"Index file not found at {index_file}. "
+            "Proceeding without it, but this may not be a sharded model."
+        )
         return None
 
 def inspect_model_weights(model_path):
@@ -66,8 +69,13 @@ def summarize_model_structure(weights):
     layer_counts = defaultdict(int)
     other_keys = []
     layer_details = defaultdict(list)
+    
+    # Separately collect biases
+    bias_keys = defaultdict(list)
 
     for key in weights.keys():
+        if key.endswith(".bias"):  # Check if the key is for a bias
+            bias_keys[key] = weights[key].shape
         if key.startswith("model.layers."):
             parts = key.split(".")
             if len(parts) > 2:
@@ -77,37 +85,44 @@ def summarize_model_structure(weights):
         else:
             other_keys.append(key)
 
-    return dict(layer_counts), other_keys, layer_details
+    return dict(layer_counts), other_keys, layer_details, dict(bias_keys)
 
-def create_or_update_index_file(weights, model_path):
+def create_or_update_index_file(model_path):
+    """
+    Creates or updates the model.safetensors.index.json file based on the
+    .safetensors files found in the model directory.
+    """
     index_file_path = os.path.join(model_path, "model.safetensors.index.json")
     index_data = load_index_file(model_path)
 
     if index_data is None:
         index_data = {"metadata": {}, "weight_map": {}}
+    else:
+        index_data["metadata"] = index_data.get("metadata", {})
+        index_data["weight_map"] = index_data.get("weight_map", {})
 
     # Determine the total size of the weights
     total_size = 0
-    for key, weight in weights.items():
-        total_size += weight.numpy().nbytes  # Use numpy() for safetensors compatibility
-        
-    index_data["metadata"]["total_size"] = total_size
-
-    # Update the weight map based on the current file structure
-    weight_map = index_data["weight_map"]
     safetensors_files = glob.glob(os.path.join(model_path, "*.safetensors"))
 
-    # Assign weights to files
     for file_path in safetensors_files:
         filename = os.path.basename(file_path)
         try:
             with safe_open(file_path, framework="pt") as f:
                 for key in f.keys():
-                    weight_map[key] = filename
+                    # Only add to weight map if not already present
+                    if key not in index_data["weight_map"]:
+                        index_data["weight_map"][key] = filename
+
+                    # Update total size calculation to use torch.numel()
+                    tensor = f.get_tensor(key)
+                    total_size += torch.numel(tensor) * tensor.element_size()  # Correctly calculate total size
         except Exception as e:
             print(f"Error opening or reading file {file_path}: {e}")
 
-    # Update the index file
+    index_data["metadata"]["total_size"] = total_size
+
+    # Save updated index file
     with open(index_file_path, "w") as f:
         json.dump(index_data, f, indent=2)
     print(f"Updated index file: {index_file_path}")
@@ -144,6 +159,11 @@ if __name__ == "__main__":
     parser.add_argument(
         "--layer_num", type=int, default=None, help="Layer number to inspect"
     )
+    parser.add_argument(
+        "--update_index",
+        action="store_true",
+        help="Update or create the model.safetensors.index.json file",
+    )
     args = parser.parse_args()
 
     model_folder = args.model_folder
@@ -160,7 +180,7 @@ if __name__ == "__main__":
 
         print(f"Total number of keys: {len(weights)}")
 
-        layer_counts, other_keys, layer_details = summarize_model_structure(weights)
+        layer_counts, other_keys, layer_details, bias_keys = summarize_model_structure(weights)
 
         print("\nLayer structure:")
         for layer, count in sorted(layer_counts.items()):
@@ -184,9 +204,16 @@ if __name__ == "__main__":
         layer_keys = [key for key in weights.keys() if key.startswith("model.layers.")]
         for key in sorted(layer_keys)[:10]:  # Print first 10 layer keys as a sample
             print(f"- {key}: {weights[key].shape}")
+        
+        # Print bias keys
+        print(f"\nNumber of bias keys: {len(bias_keys)}")
+        print("Bias keys:")
+        for key, shape in bias_keys.items():
+            print(f"- {key}: {shape}")
 
-        # Call the function to create or update the index file
-        create_or_update_index_file(weights, model_folder)
+        # Update the index file if requested
+        if args.update_index:
+            create_or_update_index_file(model_folder)
 
     except Exception as e:
         print(f"An error occurred: {str(e)}")
