@@ -6,6 +6,16 @@ import os
 import shutil
 from datetime import datetime
 
+import logging
+
+# Configure logging
+logging.basicConfig(
+    filename='transform_debug.log',
+    level=logging.DEBUG,
+    format='%(asctime)s - %(levelname)s - %(module)s - %(lineno)d - %(message)s',
+    filemode='w'
+)
+
 def combine_weights(weights, layer_prefix, layer_name, num_experts):
     """
     Combines the weights and biases for a given layer across all experts.
@@ -20,7 +30,7 @@ def combine_weights(weights, layer_prefix, layer_name, num_experts):
     for e in range(num_experts):
         weight_key = f"{layer_prefix}.mlp.experts.{e}.{layer_name}.weight"
         if weight_key in weights:
-            to_combine.append(weights.pop(weight_key))
+            to_combine.append(weights[weight_key])
 
     if to_combine:
         combined_weight = mx.concatenate(to_combine, axis=0)
@@ -31,7 +41,7 @@ def combine_weights(weights, layer_prefix, layer_name, num_experts):
     for e in range(num_experts):
         bias_key = f"{layer_prefix}.mlp.experts.{e}.{layer_name}.bias"
         if bias_key in weights:
-            to_combine_bias.append(weights.pop(bias_key))
+            to_combine_bias.append(weights[bias_key])
     if to_combine_bias:
         combined_bias = mx.concatenate(to_combine_bias, axis=0)
         weights[f"{layer_prefix}.mlp.switch_mlp.{layer_name}.bias"] = combined_bias
@@ -47,8 +57,11 @@ def transform_parameter_name(param_name):
         str: The transformed parameter name.
     """
 
+    logging.debug(f"---- Original parameter name: {param_name}")
+
     # Pattern for MoE expert parameters
-    moe_pattern = r"model\.layers\.(\d+)\.model\.layers\.\d+\.mlp\.mlp\.experts\.(\d+)\.(up_proj|down_proj|gate_proj)\.(weight|bias)"
+    # Example: model.layers.0.mlp.experts.0.down_proj.weight
+    moe_pattern = r"model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.(up_proj|down_proj|gate_proj)\.(weight|bias)"
     match = re.match(moe_pattern, param_name)
     if match:
         layer, expert, proj_type, param_type = match.groups()
@@ -57,62 +70,86 @@ def transform_parameter_name(param_name):
             proj_type = 'gate'
         else:
             proj_type = proj_type.replace("_proj", "")
-        return f"model.layers.{layer}.mlp.experts.{expert}.{proj_type}.{param_type}"
+        transformed_name = f"model.layers.{layer}.mlp.experts.{expert}.{proj_type}.{param_type}"
+        logging.debug(f"     Transformed (MoE expert): {transformed_name}")
+        return transformed_name
 
     # Pattern for shared MLP parameters
-    shared_moe_pattern = r"model\.layers\.(\d+)\.model\.layers\.\d+\.mlp\.shared_mlp\.(gate_proj|down_proj|up_proj)\.(weight|bias)"
+    # Example: model.layers.0.mlp.shared_mlp.down_proj.weight
+    shared_moe_pattern = r"model\.layers\.(\d+)\.mlp\.shared_mlp\.(gate_proj|down_proj|up_proj)\.(weight|bias)"
     match = re.match(shared_moe_pattern, param_name)
     if match:
         layer, proj_type, param_type = match.groups()
         # Modify the structure to match mlp.gate.weight, etc.
         proj_type = proj_type.replace("_proj", "")
-        # The shared mlp should map to experts.0
-        return f"model.layers.{layer}.mlp.experts.0.{proj_type}.{param_type}" 
+        
+        transformed_name = f"model.layers.{layer}.mlp.shared_expert.{proj_type}.{param_type}"
+        logging.debug(f"     Transformed (shared MLP): {transformed_name}")
+        return transformed_name
 
     # Pattern for gate parameters
-    gate_pattern = r"model\.layers\.(\d+)\.model\.layers\.\d+\.mlp\.gate\.wg\.(weight|bias)"
+    # Example: model.layers.0.mlp.gate.wg.weight
+    gate_pattern = r"model\.layers\.(\d+)\.mlp\.gate\.wg\.(weight|bias)"
     match = re.match(gate_pattern, param_name)
     if match:
         layer, param_type = match.groups()
         # Modify the structure to match mlp.gate.wg.weight or mlp.gate.wg.bias
-        return f"model.layers.{layer}.mlp.gate.wg.{param_type}"
+        transformed_name = f"model.layers.{layer}.mlp.gate.{param_type}"
+        logging.debug(f"     Transformed (gate): {transformed_name}")
+        return transformed_name
 
     # Pattern for self-attention parameters
-    self_attn_pattern = r"model\.layers\.(\d+)\.model\.layers\.\d+\.self_attn\.(query_proj|key_layernorm|value_proj|o_proj|query_layernorm|key_proj|v_proj|q_proj)\.(weight|bias)"
+    # Example: model.layers.0.self_attn.query_proj.weight
+    self_attn_pattern = r"model\.layers\.(\d+)\.self_attn\.(query_proj|key_layernorm|value_proj|o_proj|query_layernorm|key_proj|v_proj|q_proj)\.(weight|bias)"
     match = re.match(self_attn_pattern, param_name)
     if match:
-        layer, attn_type, _, param_type = match.groups()
-        # Ensure attn_type is not captured as _ in the return value.
-        return f"model.layers.{layer}.self_attn.{attn_type}.{param_type}"
+        layer, attn_type, param_type = match.groups()
+        transformed_name = f"model.layers.{layer}.self_attn.{attn_type}.{param_type}"
+        logging.debug(f"     Transformed (self-attn): {transformed_name}")
+        return transformed_name
+        
 
     # Pattern for input layernorm, post attention layernorm weights
+    # Example: model.layers.0.input_layernorm.weight
     layer_norm_pattern = r"model\.layers\.(\d+)\.(input_layernorm|post_attention_layernorm)\.weight"
     match = re.match(layer_norm_pattern, param_name)
     if match:
         layer, norm_type = match.groups()
-        return f"model.layers.{layer}.{norm_type}.weight"
+        transformed_name = f"model.layers.{layer}.{norm_type}.weight"
+        logging.debug(f"     Transformed (layer norm): {transformed_name}")
+        return transformed_name
 
     # Pattern for attention bias parameters
-    attn_bias_pattern = r"model\.layers\.(\d+)\.(self_attn\.(?:q|k|v)_proj)\.bias"
+    # Example: model.layers.0.self_attn.q_proj.bias
+    attn_bias_pattern = r"model\.layers\.(\d+)\.self_attn\.(q_proj|k_proj|v_proj)\.bias"
     match = re.match(attn_bias_pattern, param_name)
     if match:
         layer, proj_type = match.groups()
-        return f"model.layers.{layer}.{proj_type}.bias"
+        transformed_name = f"model.layers.{layer}.self_attn.{proj_type}.bias"
+        logging.debug(f"     Transformed (attn bias): {transformed_name}")
+        return transformed_name
 
     # Pattern for embedding and norm weights
+    # Example: model.embed_tokens.weight
     non_layer_pattern = r"model\.(embed_tokens|norm)\.(weight)"
     match = re.match(non_layer_pattern, param_name)
     if match:
         component, weight_type = match.groups()
-        return f"model.{component}.{weight_type}"
+        transformed_name = f"model.{component}.{weight_type}"
+        logging.debug(f"     Transformed (non-layer): {transformed_name}")
+        return transformed_name
 
     # Pattern for shared expert gate parameters
-    shared_expert_gate_pattern = r"model\.layers\.(\d+)\.model\.layers\.\d+\.mlp\.shared_expert_gate\.(weight|bias)"
+    # Example: model.layers.0.mlp.shared_expert_gate.weight
+    shared_expert_gate_pattern = r"model\.layers\.(\d+)\.mlp\.shared_expert_gate\.(weight|bias)"
     match = re.match(shared_expert_gate_pattern, param_name)
     if match:
         layer, param_type = match.groups()
-        return f"model.layers.{layer}.mlp.shared_expert_gate.{param_type}"
+        transformed_name = f"model.layers.{layer}.mlp.shared_expert_gate.{param_type}"
+        logging.debug(f"     Transformed (shared expert gate): {transformed_name}")
+        return transformed_name
 
+    logging.debug("     No transformation applied.")
     return param_name  # Return original if no pattern matches
 
 def create_transformed_weight_map(original_weight_map):
@@ -149,6 +186,9 @@ def create_transformed_index_file(original_index_file_path, output_file_path):
     except json.JSONDecodeError:
         print(f"Error: Invalid JSON format in {original_index_file_path}")
         return
+    
+    # Extract and keep the original weight map
+    original_weight_map = original_index["weight_map"].copy()
 
     transformed_weight_map = create_transformed_weight_map(original_index["weight_map"])
 
@@ -161,6 +201,19 @@ def create_transformed_index_file(original_index_file_path, output_file_path):
         json.dump(transformed_index, f, indent=2)
 
     print(f"Transformed index file created at {output_file_path}")
+
+    # Create a new index file for the original weights
+    original_index = {
+        "metadata": original_index["metadata"],
+        "weight_map": original_weight_map
+    }
+    
+    original_output_path = os.path.join(os.path.dirname(output_file_path), "model.safetensors.index.json")
+    
+    with open(original_output_path, "w") as f:
+        json.dump(original_index, f, indent=2)
+
+    print(f"Original index file copied and saved as {original_output_path}")
 
 def main():
     parser = argparse.ArgumentParser(description="Transform a safetensors index file for MLX Hunyuan model.")
