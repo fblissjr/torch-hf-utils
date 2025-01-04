@@ -66,7 +66,8 @@ def transform_parameter_name(param_name):
         layer, proj_type, param_type = match.groups()
         # Modify the structure to match mlp.gate.weight, etc.
         proj_type = proj_type.replace("_proj", "")
-        return f"model.layers.{layer}.mlp.{proj_type}.{param_type}"
+        # The shared mlp should map to experts.0
+        return f"model.layers.{layer}.mlp.experts.0.{proj_type}.{param_type}" 
 
     # Pattern for gate parameters
     gate_pattern = r"model\.layers\.(\d+)\.model\.layers\.\d+\.mlp\.gate\.wg\.(weight|bias)"
@@ -80,7 +81,7 @@ def transform_parameter_name(param_name):
     self_attn_pattern = r"model\.layers\.(\d+)\.model\.layers\.\d+\.self_attn\.(query_proj|key_layernorm|value_proj|o_proj|query_layernorm|key_proj|v_proj|q_proj)\.(weight|bias)"
     match = re.match(self_attn_pattern, param_name)
     if match:
-        layer, attn_type, param_type = match.groups()
+        layer, attn_type, _, param_type = match.groups()
         # Ensure attn_type is not captured as _ in the return value.
         return f"model.layers.{layer}.self_attn.{attn_type}.{param_type}"
 
